@@ -18,6 +18,8 @@ TIERS = {
     4: ("Tier 4 - Greet / clarify", "info"),
 }
 EXAMPLES = [
+    "Your checkout keeps rejecting my card and I’m losing my mind",
+    "Honestly the worst customer service I have dealt with. My delivery is late again",
     "What payment methods do you accept for orders?",
     "Hello! how can i get refund",
     "How do I recover my password?",

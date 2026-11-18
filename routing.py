@@ -1,4 +1,4 @@
-"""Routing rules shared by the training notebook and app.py (single source of truth)."""
+
 import re
 
 GENERAL = "GENERAL"
@@ -11,9 +11,13 @@ DEFAULT_CONFIG = {
     "greeting_min_prob": 0.50,
     "dept_min_conf": 0.40,        # below this the retrieval search ignores the predicted department
     "retrieval_min_sim": 0.55,    # overwritten by the calibrated value
+    "cue_required_when_frustrated": True,  # a FRUSTRATED message needs a severity / human-request cue to reach Tier 1
+    "lowsim_to_ticket": True,        # in-domain question with no good canned answer -> Tier 2 ticket instead of Tier 4
+    "lowsim_dept_min_conf": 0.70,    # ...only when the department head is this sure it is in-domain
+    "lowsim_ticket_min_sim": 0.38,   # ...and the text is at least vaguely on-topic (off-topic text scores <= ~0.33)
 }
 
-# ------------------------------------------------------------------ placeholder cleaning (Issue 6)
+
 _PLACEHOLDER = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 _NUMBERED = {"order number": "order", "invoice number": "invoice", "tracking number": "shipment"}
 _DEFAULTS = {
@@ -66,6 +70,33 @@ def clean_response(text, context=None):
     return re.sub(r"[ \t]{2,}", " ", text).strip()
 
 
+
+# ------------------------------------------------------------------ severity corroboration (Issue 7)
+# The urgency head cannot tell ANGER from SEVERITY (angry complaints get P(critical) ~ 0.8-1.0), so a model score alone
+# is not enough for a live-agent escalation. Tier 1 additionally needs one of these cues in the text.
+_SEVERE_CUE = re.compile(
+    r"unauthori[sz]ed|fraud|stolen|\bstole\b|hack(?:ed|er)?|scam|identity theft|emergency|lawyer|solicitor|legal action|"
+    r"dispute (?:the|this) charge|double[- ]charged|billed (?:twice|again|three times|multiple times)|"
+    r"(?:charged|taken|deducted|debited)(?: me| from my [a-z ]+)? (?:twice|two times|three times|multiple times|again)|"
+    r"(?:never|did not|didn'?t) (?:make|authori[sz]e|place|recogni[sz]e|request|buy|order)|(?:do not|don'?t) recogni[sz]e|"
+    r"someone (?:else )?(?:got into|logged into|is using|used|accessed|changed)|somebody (?:is using|used|got into|logged into)|"
+    r"overdrawn|compromised|dangerous|sparking|burning|on fire|start a fire|could (?:hurt|injure|kill)",
+    re.I)
+_HUMAN_REQUEST = re.compile(
+    r"(?:talk|speak|chat)(?:ing)? (?:to|with) (?:a |an |the |my )?(?:real |live )?(?:person|human|agent|representative|manager|supervisor)|"
+    r"(?:real|live) (?:person|human|agent)|human (?:agent|representative|being)|(?:transfer|connect|put) me (?:to|through)|"
+    r"(?:through|over) to a (?:human|person|manager)",
+    re.I)
+
+
+def has_severe_cue(text):
+    return bool(_SEVERE_CUE.search(text or ""))
+
+
+def wants_human(text):
+    return bool(_HUMAN_REQUEST.search(text or ""))
+
+
 # ------------------------------------------------------------------ retrieval gate (Issue 3)
 def best_match(query_emb, pool_embs, pool_categories, dept, dept_conf, cfg=None):
     """Index + cosine similarity of the closest pool item. Restricts to the predicted department when we trust it."""
@@ -103,10 +134,21 @@ def route_ticket(pred, retrieve_fn=None, create_ticket_fn=None, cfg=None):
     def ticket(urgency, priority):
         return create_ticket_fn(text, dept, urgency, sent_label, priority) if create_ticket_fn else "TCK-DRYRUN"
 
-    # Tier 1 - likely critical, regardless of tone
+    frustrated = p_frus >= cfg["frustrated_prob"]
+    # Anger is what the urgency head confuses with severity, so only an angry message has to prove severity with a cue.
+    corroborated = (not frustrated) or (not cfg["cue_required_when_frustrated"]) or has_severe_cue(text) or wants_human(text)
+
+    # Tier 1 - model says critical; if the customer is also angry the text must back it up (fraud / unauthorised charge / wants a human / safety ...)
     if p_crit >= cfg["escalate_crit_prob"]:
-        who = "a human agent" if dept == GENERAL else f"a human agent ({dept})"
-        return out(1, "escalate_to_human", f"I understand this is urgent. I'm connecting you to {who} right now.", "critical")
+        if corroborated:
+            who = "a human agent" if dept == GENERAL else f"a human agent ({dept})"
+            return out(1, "escalate_to_human", f"I understand this is urgent. I'm connecting you to {who} right now.", "critical")
+        # Model alone says "critical" (usually just an angry tone). Still goes to a human fast, but as a priority ticket.
+        tid = ticket("critical?", "high")
+        lead = "I'm really sorry about this - " if frustrated else "I want to make sure this gets the right attention. "
+        return out(2, "empathy_and_ticket",
+                   f"{lead}I've created priority ticket {tid} and a team member will review it shortly.",
+                   "critical_uncorroborated", tid)
 
     # Possibly critical but not sure -> never let it fall through to "I didn't catch that"
     if p_crit >= cfg["review_crit_prob"] and top_urg in ("critical", "routine"):
@@ -115,6 +157,16 @@ def route_ticket(pred, retrieve_fn=None, create_ticket_fn=None, cfg=None):
                    f"I want to make sure this gets the right attention. I've created priority ticket {tid} and a team member will review it shortly.",
                    "possible_critical", tid)
 
+    # Tier 2 - frustrated customer. Checked BEFORE the greeting / off-topic gates so an angry message with no clear topic
+    # ("This is useless.") is not answered with "Hi! How can I help you today?".
+    if frustrated:
+        routine = p_rout >= cfg["routine_min_prob"]
+        tid = ticket("routine" if routine else top_urg, "normal")
+        return out(2, "empathy_and_ticket",
+                   f"I'm really sorry about the frustration - that's not the experience we want you to have. "
+                   f"I've created ticket {tid} and a team member will review it and get back to you.",
+                   "routine_frustrated" if routine else "frustrated_other", tid)
+
     if top_urg == "greeting" and pu.get("greeting", 0.0) >= cfg["greeting_min_prob"]:
         return out(4, "greet", "Hi! How can I help you today?", "greeting")
 
@@ -122,12 +174,6 @@ def route_ticket(pred, retrieve_fn=None, create_ticket_fn=None, cfg=None):
         return out(4, "clarify", "I can help with orders, payments, refunds, shipping, invoices and accounts. What do you need help with?", "out_of_scope")
 
     if p_rout >= cfg["routine_min_prob"]:
-        # Tier 2 - routine but frustrated
-        if p_frus >= cfg["frustrated_prob"]:
-            tid = ticket("routine", "normal")
-            return out(2, "empathy_and_ticket",
-                       f"I'm really sorry about the frustration - that's not the experience we want you to have. "
-                       f"I've created ticket {tid} and a team member will review it and get back to you.", "routine_frustrated", tid)
         # Tier 3 - only with a real match
         if retrieve_fn is None:
             return out(3, "bot_resolves", "(bot answer goes here)", "routine_calm")
@@ -136,6 +182,13 @@ def route_ticket(pred, retrieve_fn=None, create_ticket_fn=None, cfg=None):
             ctx = extract_slots(text)
             return out(3, "bot_resolves", clean_response(hit["reply"], ctx), "routine_calm", None, hit["similarity"], hit.get("matched_instruction"))
         sim = hit["similarity"] if hit else None
+        # In-domain question but no trustworthy canned answer: hand it to a human rather than a dead-end "rephrase" reply.
+        if (cfg["lowsim_to_ticket"] and dept_conf >= cfg["lowsim_dept_min_conf"]
+                and sim is not None and sim >= cfg["lowsim_ticket_min_sim"]):
+            tid = ticket("routine", "normal")
+            return out(2, "ticket_for_human",
+                       f"I'm not able to answer that one reliably myself, so I've created ticket {tid} and a team member will get back to you.",
+                       "no_confident_answer", tid, sim)
         return out(4, "clarify", "I'm not sure I have the right answer for that. Could you rephrase it, or tell me a bit more about what you need?",
                    "low_retrieval_similarity", None, sim)
 
